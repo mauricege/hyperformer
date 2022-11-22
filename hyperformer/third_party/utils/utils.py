@@ -22,7 +22,8 @@ import pickle
 import socket
 from logging import getLogger
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Tuple, Union, Optional
+from dataclasses import dataclass
 
 import git
 import numpy as np
@@ -36,7 +37,8 @@ from torch.utils.data import Dataset, Sampler
 from .sentence_splitter import add_newline_to_end_of_each_sentence
 from transformers import BartTokenizer, EvalPrediction, PreTrainedTokenizer, T5Tokenizer
 from transformers.file_utils import cached_property
-from transformers.modeling_bart import shift_tokens_right
+from transformers.models.bart.modeling_bart import shift_tokens_right
+from transformers import Wav2Vec2Processor
 
 
 try:
@@ -570,6 +572,8 @@ def freeze_embeds(model):
         for d in [model.model.encoder, model.model.decoder]:
             freeze_params(d.embed_positions)
             freeze_params(d.embed_tokens)
+    elif model_type == "wav2vec2":
+        model.freeze_feature_encoder
     else:
         freeze_params(model.model.shared)
         for d in [model.model.encoder, model.model.decoder]:
@@ -712,3 +716,62 @@ class TaskCollator:
     assert (len(set(tasks)) == 1)
     batch_encoding["task"] = tasks[0]
     return batch_encoding.data
+
+
+@dataclass
+class DataCollatorCTCWithPadding:
+    """
+    Data collator that will dynamically pad the inputs received.
+    Args:
+        processor (:class:`~transformers.Wav2Vec2Processor`)
+            The processor used for proccessing the data.
+        padding (:obj:`bool`, :obj:`str` or :class:`~transformers.tokenization_utils_base.PaddingStrategy`, `optional`, defaults to :obj:`True`):
+            Select a strategy to pad the returned sequences (according to the model's padding side and padding index)
+            among:
+            * :obj:`True` or :obj:`'longest'`: Pad to the longest sequence in the batch (or no padding if only a single
+              sequence if provided).
+            * :obj:`'max_length'`: Pad to a maximum length specified with the argument :obj:`max_length` or to the
+              maximum acceptable input length for the model if that argument is not provided.
+            * :obj:`False` or :obj:`'do_not_pad'` (default): No padding (i.e., can output a batch with sequences of
+              different lengths).
+        max_length (:obj:`int`, `optional`):
+            Maximum length of the ``input_values`` of the returned list and optionally padding length (see above).
+        max_length_labels (:obj:`int`, `optional`):
+            Maximum length of the ``labels`` returned list and optionally padding length (see above).
+        pad_to_multiple_of (:obj:`int`, `optional`):
+            If set will pad the sequence to a multiple of the provided value.
+            This is especially useful to enable the use of Tensor Cores on NVIDIA hardware with compute capability >=
+            7.5 (Volta).
+    """
+
+    processor: Wav2Vec2Processor
+    padding: Union[bool, str] = True
+    max_length: Optional[int] = None
+    max_length_labels: Optional[int] = None
+    pad_to_multiple_of: Optional[int] = None
+    pad_to_multiple_of_labels: Optional[int] = None
+
+    def __call__(
+        self, features: List[Dict[str, Union[List[int], torch.Tensor]]]
+    ) -> Dict[str, torch.Tensor]:
+        input_features = [
+            {"input_values": feature["input_values"][0]} for feature in features
+        ]
+        label_features = [feature["labels"] for feature in features]
+        task_features = [feature["task"] for feature in features]
+
+        d_type = torch.long if isinstance(label_features[0], int) else torch.float
+
+        batch = self.processor.pad(
+            input_features,
+            padding=self.padding,
+            max_length=self.max_length,
+            truncation=True,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors="pt",
+        )
+
+        batch["labels"] = torch.tensor(label_features, dtype=d_type)
+        batch["task"] = task_features[0] # there should be only one task per batch
+
+        return batch

@@ -6,7 +6,7 @@ import warnings
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from transformers.modeling_outputs import BaseModelOutput
-from transformers.modeling_t5 import (T5PreTrainedModel, T5LayerNorm, T5Block,
+from transformers import (T5PreTrainedModel, T5LayerNorm, T5Block,
                                       T5DenseReluDense, T5Attention, T5LayerCrossAttention)
 from transformers.utils import logging
 

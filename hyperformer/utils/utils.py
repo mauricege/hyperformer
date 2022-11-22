@@ -6,11 +6,16 @@ from hyperformer.third_party.utils import (
     assert_all_frozen,
     freeze_embeds,
     freeze_params,
-    save_json)
-from transformers.modeling_t5 import T5LayerNorm
+    save_json,
+)
+from torch.nn import LayerNorm
 
-from hyperformer.adapters import (AdapterController, MetaAdapterController, 
-                              AdapterLayersHyperNetController, AdapterLayersOneHyperNetController)
+from hyperformer.adapters import (
+    AdapterController,
+    MetaAdapterController,
+    AdapterLayersHyperNetController,
+    AdapterLayersOneHyperNetController,
+)
 from hyperformer.data import TASK_MAPPING
 
 logger = getLogger(__name__)
@@ -26,7 +31,7 @@ def create_dir(output_dir):
         os.makedirs(output_dir)
 
 
-def handle_metrics(split, metrics, output_dir): #, gcs_bucket=None):
+def handle_metrics(split, metrics, output_dir):  # , gcs_bucket=None):
     """
     Prints and saves metrics or a general dictionary of results.
 
@@ -63,6 +68,12 @@ def get_training_args(arguments_list):
     for arguments in arguments_list:
         all_arguments.update(asdict(arguments))
     all_arguments.pop("evaluation_strategy")
+    all_arguments.pop("logging_strategy")
+    all_arguments.pop("save_strategy")
+    all_arguments.pop("hub_strategy")
+    all_arguments.pop("optim")
+    all_arguments.pop("lr_scheduler_type")
+    all_arguments.pop("task_embeddings")
     return all_arguments
 
 
@@ -78,7 +89,7 @@ def get_last_checkpoint_path(output_dir):
     if len(paths) == 0:
         return output_dir
     else:
-        checkpoints = [int(checkpoint.split('-')[-1]) for checkpoint in paths]
+        checkpoints = [int(checkpoint.split("-")[-1]) for checkpoint in paths]
         max_checkpoint = max(checkpoints)
         return os.path.join(output_dir, "checkpoint-" + str(max_checkpoint))
 
@@ -120,7 +131,9 @@ def freezing_params(model, training_args, model_args, adapter_args):
                 param.requires_grad = True
         if adapter_args.unique_hyper_net:
             for name, sub_module in model.named_modules():
-                if isinstance(sub_module, (AdapterLayersHyperNetController, AdapterController)):
+                if isinstance(
+                    sub_module, (AdapterLayersHyperNetController, AdapterController)
+                ):
                     for param_name, param in sub_module.named_parameters():
                         param.requires_grad = True
         if adapter_args.efficient_unique_hyper_net:
@@ -132,38 +145,65 @@ def freezing_params(model, training_args, model_args, adapter_args):
         freeze_params(model)
 
     # Freezes all models parameters except last linear layer of decoder.
-    if model_args.freeze_model_but_lm_head:
+    # if model_args.freeze_model_but_lm_head:
+    #     freeze_params(model)
+    #     for param in model.lm_head.parameters():
+    #         param.requires_grad = True
+
+    if model_args.freeze_model_but_classifier_head:
         freeze_params(model)
-        for param in model.lm_head.parameters():
+        for param in model.projector.parameters():
+            param.requires_grad = True
+        for param in model.classifier.parameters():
             param.requires_grad = True
 
-    if model_args.freeze_embeds:
-        freeze_embeds(model)
+    
 
-    if model_args.freeze_encoder:
-        freeze_params(model.get_encoder())
-        assert_all_frozen(model.get_encoder())
+    # if model_args.freeze_encoder:
+    #     freeze_params(model.get_encoder())
+    #     assert_all_frozen(model.get_encoder())
 
     # In case of meta-adapters and if task-embeddings are paramteric,
     # freezes all parameters except task-embedding parameters.
     if model_args.freeze_model_but_task_embeddings:
         freeze_params(model)
-        if adapter_args.adapter_config_name == "meta-adapter" and \
-                not isinstance(model.task_embedding_controller.task_to_embeddings, dict):
-            for param in model.task_embedding_controller.task_to_embeddings.parameters():
+        if adapter_args.adapter_config_name == "meta-adapter" and not isinstance(
+            model.task_embedding_controller.task_to_embeddings, dict
+        ):
+            for (
+                param
+            ) in model.task_embedding_controller.task_to_embeddings.parameters():
                 param.requires_grad = True
 
     # Unfreezes last linear layer of decoder.
-    if model_args.unfreeze_lm_head:
-        for param in model.lm_head.parameters():
+    # if model_args.unfreeze_lm_head:
+    #     for param in model.lm_head.parameters():
+    #         param.requires_grad = True
+    if model_args.unfreeze_classifier_head:
+        for param in model.projector.parameters():
+            param.requires_grad = True
+        for param in model.classifier.parameters():
             param.requires_grad = True
 
     # Unfreezes layer norms.
     if model_args.unfreeze_layer_norms:
         for name, sub_module in model.named_modules():
-            if isinstance(sub_module, T5LayerNorm):
+            if isinstance(sub_module, LayerNorm):
                 for param_name, param in sub_module.named_parameters():
                     param.requires_grad = True
+    
+    if model_args.freeze_embeds:
+        model.freeze_feature_encoder()
+        # freeze_embeds(model)
+
+    if model_args.unfreeze_encoder:
+        for param in model.wav2vec2.feature_projection.parameters():
+            param.requires_grad = True
+        for param in model.wav2vec2.encoder.parameters():
+            param.requires_grad = True
+        if model.wav2vec2.adapter is not None:
+            for param in model.wav2vec2.adapter.parameters():
+                param.requires_grad = True
 
     if model_args.unfreeze_model:
         for param in model.parameters():

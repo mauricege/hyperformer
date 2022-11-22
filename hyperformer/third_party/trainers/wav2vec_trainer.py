@@ -2,19 +2,18 @@
 
 import collections
 import math
+import os
+import time
 
 import numpy as np
-import os
 import torch
 from packaging import version
 from torch import nn
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from transformers import PreTrainedModel, logging
-from transformers import Trainer
-from transformers import FSMTConfig
+from transformers import FSMTConfig, PreTrainedModel, Trainer, logging
 from transformers.file_utils import is_torch_tpu_available
-from transformers.integrations import (hp_params)
+from transformers.integrations import hp_params
 from transformers.optimization import (
     Adafactor,
     AdamW,
@@ -26,8 +25,7 @@ from transformers.optimization import (
     get_polynomial_decay_schedule_with_warmup,
 )
 from transformers.trainer_callback import TrainerState
-from transformers.trainer_utils import (TrainOutput)
-from transformers.trainer_utils import (set_seed)
+from transformers.trainer_utils import TrainOutput, PredictionOutput, set_seed, speed_metrics
 
 # Check if Pytorch version >= 1.6 to switch between Native AMP and Apex
 if version.parse(torch.__version__) < version.parse("1.6"):
@@ -38,6 +36,7 @@ if version.parse(torch.__version__) < version.parse("1.6"):
     _use_apex = True
 else:
     _use_native_amp = True
+    _use_apex = False
 
 if version.parse(torch.__version__) < version.parse("1.2"):
     _use_ddp_no_sync = False
@@ -49,12 +48,12 @@ if is_torch_tpu_available():
     import torch_xla.debug.metrics as met
     import torch_xla.distributed.parallel_loader as pl
 
-from typing import Any, Dict, Optional, Tuple, Union
-from torch.utils.data.dataset import Dataset
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from hyperformer.adapters import MetaAdapterConfig
-from hyperformer.utils import use_task_specific_params, reset_config
 from hyperformer.data import MultiTaskBatchSampler
+from hyperformer.utils import reset_config, use_task_specific_params
+from torch.utils.data.dataset import Dataset
 
 logger = logging.get_logger(__name__)
 
@@ -72,9 +71,17 @@ if is_torch_tpu_available():
     import torch_xla.debug.metrics as met
 
 
-class T5Trainer(Trainer):
-    def __init__(self, config=None, data_args=None, dataset_sizes=None, adapter_config=None,
-                 multi_task_compute_metrics=None, *args, **kwargs):
+class Wav2Vec2Trainer(Trainer):
+    def __init__(
+        self,
+        config=None,
+        data_args=None,
+        dataset_sizes=None,
+        adapter_config=None,
+        multi_task_compute_metrics=None,
+        *args,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
 
         if config is None:
@@ -89,25 +96,25 @@ class T5Trainer(Trainer):
         self.multi_task_compute_metrics = multi_task_compute_metrics
         self.dataset_sizes = dataset_sizes
         self.data_args = data_args
-        self.vocab_size = self.config.tgt_vocab_size if isinstance(self.config, FSMTConfig) else self.config.vocab_size
+        # self.vocab_size = self.config.tgt_vocab_size if isinstance(self.config, FSMTConfig) else self.config.vocab_size
 
-        if self.args.label_smoothing != 0 or (self.data_args is not None and self.data_args.ignore_pad_token_for_loss):
-            assert (
-                    self.config.pad_token_id is not None
-            ), "Make sure that `config.pad_token_id` is correcly defined when ignoring `pad_token` for loss calculation or doing label smoothing."
+        # if self.args.label_smoothing != 0 or (self.data_args is not None and self.data_args.ignore_pad_token_for_loss):
+        #     assert (
+        #             self.config.pad_token_id is not None
+        #     ), "Make sure that `config.pad_token_id` is correcly defined when ignoring `pad_token` for loss calculation or doing label smoothing."
 
-        if self.config.pad_token_id is None and self.config.eos_token_id is not None:
-            logger.warn(
-                f"The `config.pad_token_id` is `None`. Using `config.eos_token_id` = {self.config.eos_token_id} for padding.."
-            )
+        # if self.config.pad_token_id is None and self.config.eos_token_id is not None:
+        #     logger.warn(
+        #         f"The `config.pad_token_id` is `None`. Using `config.eos_token_id` = {self.config.eos_token_id} for padding.."
+        #     )
 
-        if self.args.label_smoothing == 0:
-            self.loss_fn = torch.nn.CrossEntropyLoss(ignore_index=self.config.pad_token_id)
-        else:
-            # dynamically import label_smoothed_nll_loss
-            from hyperformer.third_party.utils import label_smoothed_nll_loss
+        # if self.args.label_smoothing == 0:
+        #     self.loss_fn = torch.nn.CrossEntropyLoss(ignore_index=self.config.pad_token_id)
+        # else:
+        #     # dynamically import label_smoothed_nll_loss
+        #     from hyperformer.third_party.utils import label_smoothed_nll_loss
 
-            self.loss_fn = label_smoothed_nll_loss
+        #     self.loss_fn = label_smoothed_nll_loss
 
     def create_optimizer_and_scheduler(self, num_training_steps: int):
         """
@@ -121,11 +128,19 @@ class T5Trainer(Trainer):
             no_decay = ["bias", "LayerNorm.weight"]
             optimizer_grouped_parameters = [
                 {
-                    "params": [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay)],
+                    "params": [
+                        p
+                        for n, p in self.model.named_parameters()
+                        if not any(nd in n for nd in no_decay)
+                    ],
                     "weight_decay": self.args.weight_decay,
                 },
                 {
-                    "params": [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay)],
+                    "params": [
+                        p
+                        for n, p in self.model.named_parameters()
+                        if any(nd in n for nd in no_decay)
+                    ],
                     "weight_decay": 0.0,
                 },
             ]
@@ -139,23 +154,31 @@ class T5Trainer(Trainer):
 
             else:
                 self.optimizer = AdamW(
-                    optimizer_grouped_parameters, lr=self.args.learning_rate, eps=self.args.adam_epsilon
+                    optimizer_grouped_parameters,
+                    lr=self.args.learning_rate,
+                    eps=self.args.adam_epsilon,
                 )
 
         if self.lr_scheduler is None:
             self.lr_scheduler = self._get_lr_scheduler(num_training_steps)
         else:  # ignoring --lr_scheduler
-            logger.warn("scheduler is passed to `Seq2SeqTrainer`, `--lr_scheduler` arg is ignored.")
+            logger.warn(
+                "scheduler is passed to `Seq2SeqTrainer`, `--lr_scheduler` arg is ignored."
+            )
 
     def _get_lr_scheduler(self, num_training_steps):
         schedule_func = arg_to_scheduler[self.args.lr_scheduler]
         if self.args.lr_scheduler == "constant":
             scheduler = schedule_func(self.optimizer)
         elif self.args.lr_scheduler == "constant_w_warmup":
-            scheduler = schedule_func(self.optimizer, num_warmup_steps=self.args.warmup_steps)
+            scheduler = schedule_func(
+                self.optimizer, num_warmup_steps=self.args.warmup_steps
+            )
         else:
             scheduler = schedule_func(
-                self.optimizer, num_warmup_steps=self.args.warmup_steps, num_training_steps=num_training_steps
+                self.optimizer,
+                num_warmup_steps=self.args.warmup_steps,
+                num_training_steps=num_training_steps,
             )
         return scheduler
 
@@ -169,24 +192,28 @@ class T5Trainer(Trainer):
         else:
             num_replicas = 1
             rank = 0
-        return MultiTaskBatchSampler(self.dataset_sizes, self.args.train_batch_size,
-                                     self.args.temperature, rank=rank,
-                                     num_replicas=num_replicas)
+        return MultiTaskBatchSampler(
+            self.dataset_sizes,
+            self.args.train_batch_size,
+            self.args.temperature,
+            rank=rank,
+            num_replicas=num_replicas,
+        )
 
     def _compute_loss(self, model, inputs, labels):
-        if self.args.label_smoothing == 0:
-            if self.data_args is not None and self.data_args.ignore_pad_token_for_loss:
-                # force training to ignore pad token
-                logits = model(**inputs, use_cache=False)[0]
-                loss = self.loss_fn(logits.view(-1, logits.shape[-1]), labels.view(-1))
-            else:
-                # compute usual loss via models
-                loss, logits = model(**inputs, labels=labels, use_cache=False)[:2]
-        else:
-            # compute label smoothed loss
-            logits = model(**inputs, use_cache=False)[0]
-            lprobs = torch.nn.functional.log_softmax(logits, dim=-1)
-            loss, _ = self.loss_fn(lprobs, labels, self.args.label_smoothing, ignore_index=self.config.pad_token_id)
+        # if self.args.label_smoothing == 0:
+        #     if self.data_args is not None and self.data_args.ignore_pad_token_for_loss:
+        #         # force training to ignore pad token
+        #         logits = model(**inputs, use_cache=False)[0]
+        #         loss = self.loss_fn(logits.view(-1, logits.shape[-1]), labels.view(-1))
+        #     else:
+        #         # compute usual loss via models
+        loss, logits = model(**inputs, labels=labels)[:2]
+        # else:
+        #     # compute label smoothed loss
+        #     logits = model(**inputs, use_cache=False)[0]
+        #     lprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+        #     loss, _ = self.loss_fn(lprobs, labels, self.args.label_smoothing, ignore_index=self.config.pad_token_id)
         return loss, logits
 
     def get_train_dataloader(self) -> DataLoader:
@@ -199,15 +226,22 @@ class T5Trainer(Trainer):
         Subclass and override this method if you want to inject some custom behavior.
         """
         multitask_sampler = self._get_train_sampler()
-        return DataLoader(self.train_dataset, batch_sampler=multitask_sampler,
-                          collate_fn=self.data_collator)
+        return DataLoader(
+            self.train_dataset,
+            batch_sampler=multitask_sampler,
+            collate_fn=self.data_collator,
+        )
 
     def compute_loss(self, model, inputs):
         labels = inputs.pop("labels")
         loss, _ = self._compute_loss(model, inputs, labels)
         return loss
 
-    def evaluate(self, eval_datasets: Optional[Dict[str, Dataset]] = None) -> Dict[str, float]:
+    def evaluate(
+        self,
+        eval_datasets: Optional[Dict[str, Dataset]] = None,
+        ignore_keys: Optional[List[str]] = None,
+    ) -> Dict[str, float]:
         """
         Run evaluation and returns metrics.
 
@@ -234,9 +268,11 @@ class T5Trainer(Trainer):
             self.compute_metrics = self.multi_task_compute_metrics[eval_task]
             model_config = self.model.config
 
-            use_task_specific_params(self.model, eval_task)
+            # use_task_specific_params(self.model, eval_task)
 
-            if eval_dataset is not None and not isinstance(eval_dataset, collections.abc.Sized):
+            if eval_dataset is not None and not isinstance(
+                eval_dataset, collections.abc.Sized
+            ):
                 raise ValueError("eval_dataset must implement __len__")
 
             eval_dataloader = self.get_eval_dataloader(eval_dataset)
@@ -246,7 +282,7 @@ class T5Trainer(Trainer):
                 description="Evaluation",
                 # No point gathering the predictions if there are no metrics, otherwise we defer to
                 # self.args.prediction_loss_only
-                prediction_loss_only=True if self.compute_metrics is None else None
+                prediction_loss_only=True if self.compute_metrics is None else None,
             )
             if self.args.tpu_metrics_debug or self.args.debug:
                 # tpu-comment: Logging debug metrics for PyTorch/XLA (compile, execute times, ops, etc.)
@@ -260,11 +296,101 @@ class T5Trainer(Trainer):
 
         # Computes the average metrics across all the tasks without their corresponding losses.
         metrics = [results[key] for key in results.keys() if "loss" not in key]
-        results['eval_average_metrics'] = np.mean(metrics)
-        self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, results)
+        results["eval_average_metrics"] = np.mean(metrics)
+        self.control = self.callback_handler.on_evaluate(
+            self.args, self.state, self.control, results
+        )
         return results
 
-    def train(self, model_path: Optional[str] = None, trial: Union["optuna.Trial", Dict[str, Any]] = None):
+    def predict(
+        self,
+        test_datasets: Dict[str, Dataset],
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "test",
+    ) -> PredictionOutput:
+        """
+        Run prediction and returns predictions and potential metrics.
+        Depending on the dataset and your use case, your test dataset may contain labels. In that case, this method
+        will also return metrics, like in `evaluate()`.
+        Args:
+            test_dataset (`Dataset`):
+                Dataset to run the predictions on. If it is an `datasets.Dataset`, columns not accepted by the
+                `model.forward()` method are automatically removed. Has to implement the method `__len__`
+            ignore_keys (`Lst[str]`, *optional*):
+                A list of keys in the output of your model (if it is a dictionary) that should be ignored when
+                gathering predictions.
+            metric_key_prefix (`str`, *optional*, defaults to `"test"`):
+                An optional prefix to be used as the metrics key prefix. For example the metrics "bleu" will be named
+                "test_bleu" if the prefix is "test" (default)
+        <Tip>
+        If your predictions or labels have different sequence length (for instance because you're doing dynamic padding
+        in a token classification task) the predictions will be padded (on the right) to allow for concatenation into
+        one array. The padding index is -100.
+        </Tip>
+        Returns: *NamedTuple* A namedtuple with the following keys:
+            - predictions (`np.ndarray`): The predictions on `test_dataset`.
+            - label_ids (`np.ndarray`, *optional*): The labels (if the dataset contained some).
+            - metrics (`Dict[str, float]`, *optional*): The potential dictionary of metrics (if the dataset contained
+              labels).
+        """
+        # memory metrics - must set up as early as possible
+        self._memory_tracker.start()
+        results = {}
+
+        for test_task, test_dataset in test_datasets.items():
+            self.compute_metrics = self.multi_task_compute_metrics[test_task]
+            model_config = self.model.config
+
+            # use_task_specific_params(self.model, test_task)
+
+            if test_dataset is not None and not isinstance(
+                test_dataset, collections.abc.Sized
+            ):
+                raise ValueError("test_dataset must implement __len__")
+
+            test_dataloader = self.get_test_dataloader(test_dataset)
+
+            start_time = time.time()
+
+            eval_loop = (
+                self.prediction_loop
+                if self.args.use_legacy_prediction_loop
+                else self.evaluation_loop
+            )
+            output = eval_loop(
+                test_dataloader,
+                description="Prediction",
+                ignore_keys=ignore_keys,
+                metric_key_prefix=metric_key_prefix,
+            )
+            total_batch_size = self.args.eval_batch_size * self.args.world_size
+            output.metrics.update(
+                speed_metrics(
+                    metric_key_prefix,
+                    start_time,
+                    num_samples=output.num_samples,
+                    num_steps=math.ceil(output.num_samples / total_batch_size),
+                )
+            )
+            # self.control = self.callback_handler.on_predict(
+            #     self.args, self.state, self.control, output.metrics
+            # )
+            self._memory_tracker.stop_and_update_metrics(output.metrics)
+            results[test_task] = PredictionOutput(
+                predictions=output.predictions,
+                label_ids=output.label_ids,
+                metrics=output.metrics,
+            )
+            reset_config(self.model, model_config)
+
+        return results
+
+    def train(
+        self,
+        model_path: Optional[str] = None,
+        trial: Union["optuna.Trial", Dict[str, Any]] = None,
+        ignore_keys_for_eval: Optional[List[str]] = None,
+    ):
         """
         Main training entry point.
 
@@ -301,15 +427,20 @@ class T5Trainer(Trainer):
         # number of training steps per epoch: num_update_steps_per_epoch
         # total number of training steps to execute: max_steps
         if train_dataset_is_sized:
-            num_update_steps_per_epoch = len(train_dataloader) // self.args.gradient_accumulation_steps
+            num_update_steps_per_epoch = (
+                len(train_dataloader) // self.args.gradient_accumulation_steps
+            )
             num_update_steps_per_epoch = max(num_update_steps_per_epoch, 1)
             if self.args.max_steps > 0:
                 max_steps = self.args.max_steps
-                num_train_epochs = self.args.max_steps // num_update_steps_per_epoch + int(
-                    self.args.max_steps % num_update_steps_per_epoch > 0
+                num_train_epochs = (
+                    self.args.max_steps // num_update_steps_per_epoch
+                    + int(self.args.max_steps % num_update_steps_per_epoch > 0)
                 )
             else:
-                max_steps = math.ceil(self.args.num_train_epochs * num_update_steps_per_epoch)
+                max_steps = math.ceil(
+                    self.args.num_train_epochs * num_update_steps_per_epoch
+                )
                 num_train_epochs = math.ceil(self.args.num_train_epochs)
         else:
             # see __init__. max_steps is set when the dataset has no __len__
@@ -328,8 +459,12 @@ class T5Trainer(Trainer):
         model = self.model
         if self.args.fp16 and _use_apex:
             if not is_apex_available():
-                raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
-            model, self.optimizer = amp.initialize(model, self.optimizer, opt_level=self.args.fp16_opt_level)
+                raise ImportError(
+                    "Please install apex from https://www.github.com/nvidia/apex to use fp16 training."
+                )
+            model, self.optimizer = amp.initialize(
+                model, self.optimizer, opt_level=self.args.fp16_opt_level
+            )
 
         # Multi-gpu training (should be after apex fp16 initialization)
         if self.args.n_gpu > 1:
@@ -355,9 +490,13 @@ class T5Trainer(Trainer):
             total_train_batch_size = self.args.train_batch_size * xm.xrt_world_size()
         else:
             total_train_batch_size = (
-                    self.args.train_batch_size
-                    * self.args.gradient_accumulation_steps
-                    * (torch.distributed.get_world_size() if self.args.local_rank != -1 else 1)
+                self.args.train_batch_size
+                * self.args.gradient_accumulation_steps
+                * (
+                    torch.distributed.get_world_size()
+                    if self.args.local_rank != -1
+                    else 1
+                )
             )
 
         num_examples = (
@@ -369,9 +508,17 @@ class T5Trainer(Trainer):
         logger.info("***** Running training *****")
         logger.info("  Num examples = %d", num_examples)
         logger.info("  Num Epochs = %d", num_train_epochs)
-        logger.info("  Instantaneous batch size per device = %d", self.args.per_device_train_batch_size)
-        logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d", total_train_batch_size)
-        logger.info("  Gradient Accumulation steps = %d", self.args.gradient_accumulation_steps)
+        logger.info(
+            "  Instantaneous batch size per device = %d",
+            self.args.per_device_train_batch_size,
+        )
+        logger.info(
+            "  Total train batch size (w. parallel, distributed & accumulation) = %d",
+            total_train_batch_size,
+        )
+        logger.info(
+            "  Gradient Accumulation steps = %d", self.args.gradient_accumulation_steps
+        )
         logger.info("  Total optimization steps = %d", max_steps)
 
         self.state.epoch = 0
@@ -379,22 +526,37 @@ class T5Trainer(Trainer):
         steps_trained_in_current_epoch = 0
 
         # Check if continuing training from a checkpoint
-        if model_path and os.path.isfile(os.path.join(model_path, "trainer_state.json")):
-            self.state = TrainerState.load_from_json(os.path.join(model_path, "trainer_state.json"))
+        if model_path and os.path.isfile(
+            os.path.join(model_path, "trainer_state.json")
+        ):
+            self.state = TrainerState.load_from_json(
+                os.path.join(model_path, "trainer_state.json")
+            )
             epochs_trained = self.state.global_step // num_update_steps_per_epoch
-            steps_trained_in_current_epoch = self.state.global_step % (num_update_steps_per_epoch)
+            steps_trained_in_current_epoch = self.state.global_step % (
+                num_update_steps_per_epoch
+            )
 
-            logger.info("  Continuing training from checkpoint, will skip to saved global_step")
+            logger.info(
+                "  Continuing training from checkpoint, will skip to saved global_step"
+            )
             logger.info("  Continuing training from epoch %d", epochs_trained)
-            logger.info("  Continuing training from global step %d", self.state.global_step)
-            logger.info("  Will skip the first %d steps in the first epoch", steps_trained_in_current_epoch)
+            logger.info(
+                "  Continuing training from global step %d", self.state.global_step
+            )
+            logger.info(
+                "  Will skip the first %d steps in the first epoch",
+                steps_trained_in_current_epoch,
+            )
 
         # Update the references
         self.callback_handler.model = self.model
         self.callback_handler.optimizer = self.optimizer
         self.callback_handler.lr_scheduler = self.lr_scheduler
         self.callback_handler.train_dataloader = train_dataloader
-        self.state.trial_name = self.hp_name(trial) if self.hp_name is not None else None
+        self.state.trial_name = (
+            self.hp_name(trial) if self.hp_name is not None else None
+        )
         self.state.trial_params = hp_params(trial) if trial is not None else None
         # This should be the same if the state has been saved but in case the training arguments changed, it's safer
         # to set this after the load.
@@ -409,21 +571,24 @@ class T5Trainer(Trainer):
         self._total_flos = self.state.total_flos
         model.zero_grad()
 
-        self.control = self.callback_handler.on_train_begin(self.args, self.state, self.control)
+        self.control = self.callback_handler.on_train_begin(
+            self.args, self.state, self.control
+        )
 
         for epoch in range(epochs_trained, num_train_epochs):
             if isinstance(train_dataloader, DataLoader) and (
-                    isinstance(train_dataloader.sampler, DistributedSampler)
-                    or isinstance(train_dataloader.batch_sampler, MultiTaskBatchSampler)):
+                isinstance(train_dataloader.sampler, DistributedSampler)
+                or isinstance(train_dataloader.batch_sampler, MultiTaskBatchSampler)
+            ):
                 if isinstance(train_dataloader.sampler, DistributedSampler):
                     train_dataloader.sampler.set_epoch(epoch)
                 else:
                     train_dataloader.batch_sampler.set_epoch(epoch)
 
             if is_torch_tpu_available():
-                parallel_loader = pl.ParallelLoader(train_dataloader, [self.args.device]).per_device_loader(
-                    self.args.device
-                )
+                parallel_loader = pl.ParallelLoader(
+                    train_dataloader, [self.args.device]
+                ).per_device_loader(self.args.device)
                 epoch_iterator = parallel_loader
             else:
                 epoch_iterator = train_dataloader
@@ -432,23 +597,29 @@ class T5Trainer(Trainer):
             if self.args.past_index >= 0:
                 self._past = None
 
-            steps_in_epoch = len(epoch_iterator) if train_dataset_is_sized else self.args.max_steps
-            self.control = self.callback_handler.on_epoch_begin(self.args, self.state, self.control)
+            steps_in_epoch = (
+                len(epoch_iterator) if train_dataset_is_sized else self.args.max_steps
+            )
+            self.control = self.callback_handler.on_epoch_begin(
+                self.args, self.state, self.control
+            )
 
+            self._total_loss_scalar = 0.0
             for step, inputs in enumerate(epoch_iterator):
-
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
                     continue
 
                 if (step + 1) % self.args.gradient_accumulation_steps == 0:
-                    self.control = self.callback_handler.on_step_begin(self.args, self.state, self.control)
+                    self.control = self.callback_handler.on_step_begin(
+                        self.args, self.state, self.control
+                    )
 
                 if (
-                        ((step + 1) % self.args.gradient_accumulation_steps != 0)
-                        and self.args.local_rank != -1
-                        and _use_ddp_no_sync
+                    ((step + 1) % self.args.gradient_accumulation_steps != 0)
+                    and self.args.local_rank != -1
+                    and _use_ddp_no_sync
                 ):
                     with model.no_sync():
                         tr_loss += self.training_step(model, inputs)
@@ -457,17 +628,23 @@ class T5Trainer(Trainer):
                 self._total_flos += self.floating_point_ops(inputs)
 
                 if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
-                        # last step in epoch but step is always smaller than gradient_accumulation_steps
-                        steps_in_epoch <= self.args.gradient_accumulation_steps
-                        and (step + 1) == steps_in_epoch
+                    # last step in epoch but step is always smaller than gradient_accumulation_steps
+                    steps_in_epoch <= self.args.gradient_accumulation_steps
+                    and (step + 1) == steps_in_epoch
                 ):
                     if self.args.fp16 and _use_native_amp:
                         self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), self.args.max_grad_norm
+                        )
                     elif self.args.fp16 and _use_apex:
-                        torch.nn.utils.clip_grad_norm_(amp.master_params(self.optimizer), self.args.max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(
+                            amp.master_params(self.optimizer), self.args.max_grad_norm
+                        )
                     else:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), self.args.max_grad_norm
+                        )
 
                     if is_torch_tpu_available():
                         xm.optimizer_step(self.optimizer)
@@ -481,15 +658,23 @@ class T5Trainer(Trainer):
                     model.zero_grad()
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
-                    self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
+                    self.control = self.callback_handler.on_step_end(
+                        self.args, self.state, self.control
+                    )
 
-                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch)
+                    self._maybe_log_save_evaluate(
+                        tr_loss, model, trial, epoch, ignore_keys_for_eval
+                    )
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
 
-            self.control = self.callback_handler.on_epoch_end(self.args, self.state, self.control)
-            self._maybe_log_save_evaluate(tr_loss, model, trial, epoch)
+            self.control = self.callback_handler.on_epoch_end(
+                self.args, self.state, self.control
+            )
+            self._maybe_log_save_evaluate(
+                tr_loss, model, trial, epoch, ignore_keys_for_eval
+            )
 
             if self.args.tpu_metrics_debug or self.args.debug:
                 if is_torch_tpu_available():
@@ -507,7 +692,9 @@ class T5Trainer(Trainer):
             # Clean the state at the end of training
             delattr(self, "_past")
 
-        logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
+        logger.info(
+            "\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n"
+        )
 
         """
         if self.args.load_best_model_at_end and self.state.best_model_checkpoint is not None:
@@ -526,13 +713,20 @@ class T5Trainer(Trainer):
             self.store_flos()
             self.log({"total_flos": self.state.total_flos})
 
-        self.control = self.callback_handler.on_train_end(self.args, self.state, self.control)
+        self.control = self.callback_handler.on_train_end(
+            self.args, self.state, self.control
+        )
 
-        return TrainOutput(self.state.global_step, tr_loss.item() / self.state.global_step)
+        return TrainOutput(
+            self.state.global_step, tr_loss.item() / self.state.global_step, {}
+        )
 
     def prediction_step(
-            self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]],
-            prediction_loss_only: bool
+        self,
+        model: nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[List[str]] = None,
     ) -> Tuple[Optional[float], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Perform an evaluation step on :obj:`model` using obj:`inputs`.
@@ -556,22 +750,31 @@ class T5Trainer(Trainer):
             A tuple with the loss, logits and labels (each being optional).
         """
         inputs = self._prepare_inputs(inputs)
-        gen_kwargs = {
-            "max_length": self.config.max_length,
-            "num_beams": self.config.num_beams
-        }
+        # gen_kwargs = {
+        #     "max_length": self.config.max_length,
+        #     "num_beams": self.config.num_beams,
+        # }
+        gen_kwargs = {}
         gen_kwargs["task"] = inputs["task"]
-        gen_kwargs["task_embedding"] = model.task_embedding_controller(inputs["task"]) if \
-            (self.config.train_adapters and isinstance(self.adapter_config, MetaAdapterConfig)) else None
-        if self.args.predict_with_generate and not self.args.prediction_loss_only:
-            generated_tokens = self.model.generate(
-                inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                **gen_kwargs,
+        gen_kwargs["task_embedding"] = (
+            model.task_embedding_controller(inputs["task"])
+            if (
+                self.config.train_adapters
+                and isinstance(self.adapter_config, MetaAdapterConfig)
             )
-            # in case the batch is shorter than max length, the output should be padded
-            if generated_tokens.shape[-1] < gen_kwargs["max_length"]:
-                generated_tokens = self._pad_tensors_to_max_len(generated_tokens, gen_kwargs["max_length"])
+            else None
+        )
+        # if self.args.predict_with_generate and not self.args.prediction_loss_only:
+        #     generated_tokens = self.model.generate(
+        #         inputs["input_ids"],
+        #         attention_mask=inputs["attention_mask"],
+        #         **gen_kwargs,
+        #     )
+        #     # in case the batch is shorter than max length, the output should be padded
+        #     if generated_tokens.shape[-1] < gen_kwargs["max_length"]:
+        #         generated_tokens = self._pad_tensors_to_max_len(
+        #             generated_tokens, gen_kwargs["max_length"]
+        #         )
 
         labels = inputs.pop("labels")
         with torch.no_grad():
@@ -584,14 +787,18 @@ class T5Trainer(Trainer):
 
         logits = generated_tokens if self.args.predict_with_generate else logits
 
-        if labels.shape[-1] < gen_kwargs["max_length"]:
-            labels = self._pad_tensors_to_max_len(labels, gen_kwargs["max_length"])
+        # if labels.shape[-1] < gen_kwargs["max_length"]:
+        #     labels = self._pad_tensors_to_max_len(labels, gen_kwargs["max_length"])
 
         return (loss, logits, labels)
 
     def _pad_tensors_to_max_len(self, tensor, max_length):
         # If PAD token is not defined at least EOS token has to be defined
-        pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else self.config.eos_token_id
+        pad_token_id = (
+            self.config.pad_token_id
+            if self.config.pad_token_id is not None
+            else self.config.eos_token_id
+        )
 
         if pad_token_id is None:
             raise ValueError(

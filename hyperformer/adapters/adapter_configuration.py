@@ -39,6 +39,7 @@ class MetaAdapterConfig(AdapterConfig):
     unique_hyper_net_layer_norm = True
     # We consider only one hyper-net for all the blocks of transformer.
     efficient_unique_hyper_net = False
+    task_mapping = None
 
 
 ADAPTER_CONFIG_MAPPING = OrderedDict(

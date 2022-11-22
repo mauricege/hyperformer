@@ -29,19 +29,21 @@ def accuracy(predictions, targets) -> dict:
 
 def pearson_corrcoef(predictions, targets) -> dict:
     """Computes Pearson correlation coefficient."""
-    pearson_corrcoef = 100 * scipy.stats.pearsonr(targets, predictions)[0]
+    pearson_corrcoef = scipy.stats.pearsonr(targets, predictions)[0]
 
     # Note that if all the predictions will be the same, spearman
     # correlation is nan, to gaurad against this, we check the output
     # and return 0 in this case.
     if math.isnan(pearson_corrcoef):
         pearson_corrcoef = 0
+    else:
+        pearson_corrcoef = pearson_corrcoef[0]
     return {"pearson_corrcoef": pearson_corrcoef}
 
 
 def spearman_corrcoef(predictions, targets) -> dict:
     """Computes Spearman correlation coefficient."""
-    spearman_corrcoef = 100 * scipy.stats.spearmanr(targets, predictions)[0]
+    spearman_corrcoef = scipy.stats.spearmanr(targets, predictions)[0]
 
     # Note that if all the predictions will be the same, spearman
     # correlation is nan, to gaurad against this, we check the output
@@ -73,7 +75,7 @@ def matthews_corrcoef(predictions, targets) -> dict:
     return {"mcc": 100 * sklearn.metrics.matthews_corrcoef(targets, predictions)}
 
 
-def build_compute_metrics_fn(task_names: List[str],
+def build_compute_metrics_fn(task_name: str, groups: List[str],
                              tokenizer: PreTrainedTokenizer) -> Callable[[EvalPrediction], Dict]:
     """Builds a dictionary from each task to the task metric."""
 
@@ -88,7 +90,8 @@ def build_compute_metrics_fn(task_names: List[str],
         return pred_str, label_str
 
     def compute_metrics(pred: EvalPrediction, metrics, post_processor=None) -> Dict:
-        pred_str, label_str = decode_pred(pred)
+        pred_str, label_str = pred.predictions, pred.label_ids
+        # pred_str, label_str = decode_pred(pred)
 
         # Applies task post-processor.
         if post_processor is not None:
@@ -109,4 +112,4 @@ def build_compute_metrics_fn(task_names: List[str],
         return functools.partial(compute_metrics, metrics=TASK_MAPPING[task].metrics,
                                  post_processor=get_post_processor(task))
 
-    return {task: tasks_metrics(task) for task in task_names}
+    return {group: tasks_metrics(task_name) for group in groups}

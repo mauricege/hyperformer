@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+from functools import reduce
 from transformers.activations import get_activation
 
 
@@ -37,7 +38,8 @@ class TaskHyperNet(nn.Module):
         self.task_embeding_generator = nn.Sequential(
             linear_layer(config.task_embedding_dim, self.task_hidden_dim),
             nn.ReLU(),
-            linear_layer(self.task_hidden_dim, self.projected_task_embedding_dim))
+            linear_layer(self.task_hidden_dim, self.projected_task_embedding_dim),
+        )
 
     def forward(self, task_embedding):
         task_embedding = task_embedding.view(-1)
@@ -49,8 +51,11 @@ class LayerNormHyperNet(nn.Module):
 
     def __init__(self, config):
         super(LayerNormHyperNet, self).__init__()
-        self.task_embedding_dim = config.projected_task_embedding_dim \
-            if config.train_task_embeddings else config.task_embedding_dim
+        self.task_embedding_dim = (
+            config.projected_task_embedding_dim
+            if config.train_task_embeddings
+            else config.task_embedding_dim
+        )
         self.weight_generator = linear_layer(self.task_embedding_dim, config.input_dim)
         self.bias_generator = linear_layer(self.task_embedding_dim, config.input_dim)
 
@@ -66,11 +71,21 @@ class TaskEmbeddingController(nn.Module):
         self.device = config.device
         self.task_embedding_dim = config.task_embedding_dim
         self.tasks = config.tasks
-        self.task_to_task_embeddings = {task: task for task in self.tasks}
+        self.task_to_task_embeddings = (
+            config.task_mapping
+            if config.task_mapping is not None
+            else {task: task for task in self.tasks}
+        )
         if config.task_to_embeddings is not None:
-            self.task_to_task_embeddings = config.task_to_embeddings
+            self.task_to_embeddings = {}
+            for task, embedding in config.task_to_embeddings.items():
+                config.task_embedding_dim = reduce(lambda l, r: l * r, embedding.shape)
+                task_embedding = torch.from_numpy(embedding).float().to(self.device)
+                task_embedding.requires_grad = False
+                self.task_to_embeddings[task] = task_embedding
             self.tasks = self.task_to_task_embeddings.values()
-        self.set_task_embeddings(self.tasks)
+        else:
+            self.set_task_embeddings(self.tasks)
         self.train_task_embeddings = config.train_task_embeddings
         if self.train_task_embeddings:
             self.task_hyper_net = TaskHyperNet(config)
@@ -81,7 +96,9 @@ class TaskEmbeddingController(nn.Module):
     def set_task_embeddings(self, tasks):
         self.task_to_embeddings = nn.ParameterDict(dict())
         for task in tasks:
-            task_embedding = torch.Tensor(torch.randn(self.task_embedding_dim)).to(self.device)
+            task_embedding = torch.Tensor(torch.randn(self.task_embedding_dim)).to(
+                self.device
+            )
             self.task_to_embeddings[task] = nn.Parameter(task_embedding)
 
     def forward(self, task):
